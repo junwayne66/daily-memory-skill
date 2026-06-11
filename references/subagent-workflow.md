@@ -1,13 +1,13 @@
 # Dynamic Subagent Workflow
 
-Use this reference when a Daily Memory run has multiple Feishu/Lark source types, a large time window, or needs stable scheduled automation. The main task agent is an orchestrator, not a monolith.
+Use this reference when a Daily Memory run has multiple Feishu/Lark source types, a large time window, or needs stable scheduled automation. The main task agent is an orchestrator, not a monolith. Loop mechanics (state, batching, ordering) are owned by the deterministic engine described in [loop-engineering.md](loop-engineering.md); subagents execute sync loops and loop bodies.
 
 ## Table Of Contents
 
 - Core Rule
 - Workflow Graph
 - Orchestrator Duties
-- Idempotency And Run Ledger
+- Idempotency
 - Subagent Contracts
 - Atomic Roles
 - Parallelization Rules
@@ -16,7 +16,7 @@ Use this reference when a Daily Memory run has multiple Feishu/Lark source types
 
 ## Core Rule
 
-Create short-lived subagents for atomic tasks. Do not create persistent agents. Do not let subagents send external notifications, update Feishu/Base records, or own long-term memory. The orchestrator launches them, gives small envelopes, coordinates through artifact manifests, reviews outputs, and performs final acceptance.
+Create short-lived subagents for atomic tasks. Do not create persistent agents. Do not let subagents send external notifications, update Feishu/Base records, or own long-term memory. The orchestrator launches them, gives small envelopes, coordinates through artifacts (source files, batch work orders, the run manifest), reviews outputs, and performs final acceptance. Subagents never bypass the engine: loop body workers process exactly the files listed in their batch work order and finish with `memoryctl commit`.
 
 ## Workflow Graph
 
@@ -26,23 +26,21 @@ orchestrator
   -> lark_auth_verifier
   -> channel_identity_resolver
   -> source_planner
-  -> parallel source collectors
-       lark_private_chat_collector
-       lark_group_chat_collector
-       lark_shared_docs_collector
-       lark_materials_collector
-       lark_calendar_collector
-       lark_meeting_minutes_collector
-       lark_tasks_base_collector
-       agent_workspace_collector
-  -> source_normalizer_deduper
-  -> event_candidate_extractor
-  -> people_entity_resolver
-  -> relation_graph_builder
-  -> timeline_progress_reconstructor
-  -> closure_status_analyzer
-  -> attention_prioritizer
-  -> knowledge_graph_merge_writer
+  -> parallel sync loop workers
+       lark_private_chat_sync
+       lark_group_chat_sync
+       lark_shared_docs_sync
+       lark_materials_sync
+       lark_calendar_sync
+       lark_meeting_minutes_sync
+       lark_tasks_base_sync
+       agent_workspace_sync
+  -> loop pipeline (engine-driven, serial)
+       memoryctl run --steps classify,graph,attention,index
+         classify_loop_worker   (per batch)
+         graph_loop_worker      (per batch)
+         attention_loop_worker  (per batch)
+         index loop             (deterministic, inline)
   -> report_composer
   -> safety_quality_reviewer
   -> memory_index_verifier
@@ -50,105 +48,70 @@ orchestrator
   -> orchestrator final acceptance
 ```
 
-Run auth/channel verification serially before source planning. Run source collectors in parallel when the platform supports it. Run merge, review, index verification, and delivery preparation serially.
+Run auth/channel verification serially before source planning. Run sync workers in parallel when the platform supports it. The loop pipeline is serial by construction: `memoryctl run` stops at the first loop with pending work, the orchestrator dispatches one loop body worker per batch, and the engine decides what comes next.
 
 ## Orchestrator Duties
 
-- Define run id, date window, timezone, source boundaries, memory root, report target, and delivery mode.
-- Load only `MEMORY.md`, relevant active event/task state, and this workflow reference.
-- Create or resume `runs/YYYY-MM-DD/run_manifest.yaml`.
-- Verify Feishu/Lark auth and owner channel identity before spawning collectors.
-- Dispatch subagents with bounded inputs and explicit output schemas.
-- Keep a manifest of expected artifact paths and role status.
-- Refuse duplicate role execution when the same source partition already has an `ok` artifact with the same input hash.
+- Define run id, date window, timezone, source boundaries, working directory, report target, and delivery mode.
+- Load only `MEMORY.md`, the latest bridge note, and this workflow reference. Do not load raw sources into orchestrator context.
+- Create or resume `runs/YYYY-MM-DD/run_manifest.yaml`; run `memoryctl init` on first use.
+- Verify Feishu/Lark auth and owner channel identity before spawning sync workers.
+- Dispatch sync workers with bounded inputs and explicit output paths under `sources/<family>/`.
+- Drive the loop pipeline: call `memoryctl run`, dispatch a loop body worker for each `next_action` batch, and verify the commit succeeded before continuing.
+- Record loop statistics (`memoryctl status`) and validation results in the run manifest.
 - Refuse third-party notifications unless the user explicitly approves the exact payload.
 - Reindex/search memory after successful writes when the platform supports it.
 - Reject delivery when the target peer id is stale, cross-app, or not resolved from the active channel account.
-- Summarize updated files, event changes, attention items, source gaps, delivery status, and open confirmations.
+- Summarize vault changes, attention items, source gaps, delivery status, and open confirmations.
 
-The orchestrator should not manually scrape every source or hold all raw data in context.
+## Idempotency
 
-## Idempotency And Run Ledger
+Idempotency is mostly engine-provided:
 
-Every scheduled run must create a run ledger:
+- Loop state files (`state/<loop>_state.json`) with mtime+hash change detection make reruns no-ops when nothing changed.
+- Pending batches are re-issued, never duplicated; two batches never share a file.
+- Sync workers must write deterministic file paths (`sources/<family>/YYYY-MM-DD__<native-id>.md`) so re-syncing the same window produces identical files and downstream loops stay quiet.
 
-```yaml
-run_id: "daily-memory_YYYY-MM-DD_<short-hash>"
-date_window:
-  start: "YYYY-MM-DDT00:00:00+08:00"
-  end: "YYYY-MM-DDT22:00:00+08:00"
-timezone: "Asia/Shanghai"
-status: "running | partial | completed | failed"
-config_hash: "sha256:..."
-source_cursors:
-  lark_private_chat: {}
-  lark_group_chat: {}
-  lark_docs: {}
-  lark_calendar: {}
-  lark_meeting_minutes: {}
-roles:
-  lark_auth_verifier:
-    status: "ok"
-    artifact: "runs/YYYY-MM-DD/artifacts/lark_auth_verifier.yaml"
-  channel_identity_resolver:
-    status: "ok"
-    artifact: "runs/YYYY-MM-DD/artifacts/channel_identity_resolver.yaml"
-  source_planner:
-    status: "ok"
-    input_hash: "sha256:..."
-    artifact: "runs/YYYY-MM-DD/artifacts/source_planner.yaml"
-delivery:
-  mode: "file | feishu_doc | feishu_private_message | both"
-  status: "not_started | drafted | sent | skipped | failed"
-```
-
-Rules:
-
-- If the same run already completed with the same `config_hash`, do not rerun collection unless the user requests `--force`.
-- If a prior run is partial, resume only failed or missing roles.
-- Each collector partitions by source type and source id. Never let two subagents collect the same chat/doc/meeting partition for the same window.
-- Each artifact write must be atomic: write a temporary file, then rename to the final path.
-- Content hashes decide duplicate suppression. Native ids alone are not enough because docs and minutes can change.
+The run manifest still records per-run facts the engine does not know: auth proofs, sync gaps, delivery status, and memory-search verification. If the same run already completed with the same `config_hash`, skip re-syncing unless the user requests `--force`; the loop pipeline can always be re-driven safely.
 
 ## Subagent Contracts
 
-All subagents receive:
+Sync workers receive:
 
 ```yaml
-role: "<subagent_role>"
+role: "<sync_role>"
 run_id: "daily-memory_YYYY-MM-DD_<short-hash>"
 date_window:
   start: "YYYY-MM-DDT00:00:00+08:00"
   end: "YYYY-MM-DDT22:00:00+08:00"
 timezone: "Asia/Shanghai"
-memory_root: "./memory"
-raw_root: "./raw/YYYY-MM-DD"
-run_root: "./runs/YYYY-MM-DD"
-allowed_tools: []
-input_paths: []
-output_paths: []
+workdir: "<abs path>"
+output_dir: "sources/<family>"
 source_partition: null
+allowed_tools: []
 constraints:
   no_third_party_notifications: true
-  owner_report_allowed_if_configured: true
   preserve_source_refs: true
   redact_secrets: true
   no_long_term_memory_writes: true
 ```
 
+Loop body workers receive the batch work order itself (`state/batches/<loop>/<batch_id>.json`, schema in [schemas.md](schemas.md)) plus the prompt path. They must:
+
+- Process only the files listed in the batch.
+- Follow the loop's prompt (`prompts/classify_source.md`, `prompts/note_creation.md`, or `prompts/attention.md`).
+- Finish with `memoryctl commit --loop <loop> --batch <batch_id>`, or `memoryctl fail` with a reason.
+
 All subagents return:
 
 ```yaml
-role: "<subagent_role>"
+role: "<role>"
 status: "ok | partial | skipped | blocked | failed"
 artifacts: []
-source_refs: []
 records_created: 0
 records_updated: 0
-duplicates_skipped: 0
 gaps: []
 warnings: []
-next_recommended_step: null
 ```
 
 ## Atomic Roles
@@ -157,7 +120,7 @@ next_recommended_step: null
 
 Inputs: run scope, prior run manifest, current config.
 
-Outputs: resume/skip decision, config hash, lock status, and role execution plan.
+Outputs: resume/skip decision, config hash, lock status, and sync plan.
 
 ### lark_auth_verifier
 
@@ -173,85 +136,39 @@ Outputs: resolved owner peer/chat id, channel account id, account display name, 
 
 ### source_planner
 
-Inputs: run scope, configured Feishu/Lark sources, existing memory hints.
+Inputs: run scope, configured Feishu/Lark sources, existing vault hints.
 
-Outputs: collector plan with source partitions, verified auth identity, exact command families, expected raw artifact paths, retry policy, chunking policy, and timeout policy.
+Outputs: sync plan with source partitions, verified auth identity, exact command families, expected output paths under `sources/`, retry policy, chunking policy, and timeout policy.
 
-### lark_private_chat_collector
+### Sync loop workers
 
-Collects Feishu/Lark one-to-one messages visible to the user identity. It should preserve counterpart identity, thread/reply metadata, attachments, and links. It must not collect unrelated private content beyond the configured work-memory scope when filtering can happen safely.
+`lark_private_chat_sync`, `lark_group_chat_sync`, `lark_shared_docs_sync`, `lark_materials_sync`, `lark_calendar_sync`, `lark_meeting_minutes_sync`, `lark_tasks_base_sync`, `agent_workspace_sync`.
 
-### lark_group_chat_collector
+Each collects one source family for the window and writes idempotent Markdown source files with provenance frontmatter (see [loop-engineering.md](loop-engineering.md) sync conventions and [schemas.md](schemas.md) source file schema). Scope rules from the previous collector roles still apply: respect configured chat/doc allowlists, preserve speaker turns and attachments metadata, prefer text previews over binary downloads, and never update tasks or Base records.
 
-Collects configured or discoverable project group chats where the user participates. It should capture mentions, replies, pinned/reference messages, linked docs, and attachment ids. If group scope is too broad, collect only configured group ids or group names from the source plan.
+### classify_loop_worker
 
-### lark_shared_docs_collector
+Executes one classify batch following `prompts/classify_source.md`: appends `relevance` frontmatter to each listed source file, then commits the batch.
 
-Finds and fetches Feishu docs/wiki docs shared with the user, mentioned in messages, attached to meetings, or updated in the run window. It should export readable markdown or block JSON and chunk long docs by heading/block.
+### graph_loop_worker
 
-### lark_materials_collector
+Executes one graph batch following `prompts/note_creation.md`: creates or merges vault notes (events, people, organizations, projects, topics, daily note) with wikilinks and provenance, then commits. The commit runs vault validation; the worker must repair schema errors before the commit passes.
 
-Collects non-doc materials referenced by messages, docs, or meetings: files, images with OCR text when available, sheets, links, and drive metadata. It saves metadata and text previews, not large binary blobs unless explicitly configured.
+### attention_loop_worker
 
-### lark_calendar_collector
-
-Collects agenda and event metadata for meetings the user attends. Calendar data provides expected time, title, attendees, organizer, meeting links, and doc links.
-
-### lark_meeting_minutes_collector
-
-Collects meeting records, meeting notes, and Feishu Minutes metadata/transcripts when authorized. It must preserve speaker turns, action items, decisions, and transcript URLs. If transcript export is unavailable, record the gap and use calendar/doc context.
-
-### lark_tasks_base_collector
-
-Collects task/Base records only when configured and authorized. It must not update tasks or Base records unless the orchestrator gives explicit approval.
-
-### agent_workspace_collector
-
-Collects OpenClaw/Hermes session pointers, cron run summaries, and relevant workspace changes. It should store pointers and short excerpts rather than dumping full sessions.
-
-### source_normalizer_deduper
-
-Normalizes raw evidence into source records, redacts secrets, computes content hashes, links related sources, and removes duplicates across chat/docs/calendar/minutes.
-
-### event_candidate_extractor
-
-Extracts event candidates from normalized records. It should output why each candidate is an event and distinguish strong events from low-confidence possible events.
-
-### people_entity_resolver
-
-Resolves people, aliases, roles, teams, organizations, and participation evidence. It must preserve uncertainty rather than invent org charts.
-
-### relation_graph_builder
-
-Builds graph edges among events, people, docs, meetings, decisions, tasks, risks, and source records.
-
-### timeline_progress_reconstructor
-
-Reconstructs event objective, start time, due time, progress updates, results, and relevant milestones from source evidence.
-
-### closure_status_analyzer
-
-Determines whether each event is open, blocked, waiting, done, cancelled, stale, or needs confirmation. It identifies missing closure evidence.
-
-### attention_prioritizer
-
-Scores user attention items by urgency, impact, confidence, deadline proximity, stakeholder dependency, blocked state, conflict, and opportunity value.
-
-### knowledge_graph_merge_writer
-
-Writes event graph, people graph, daily memory, root bridge note, attention queue, decisions, tasks, and risks. It must preserve old facts, add conflicts instead of overwriting silently, and keep root `MEMORY.md` short.
+Executes one attention batch following `prompts/attention.md`: turns engine-computed signals into `attention_score`, `attention_reasons`, and `next_action` on open event notes, then commits.
 
 ### report_composer
 
-Creates the user-facing report: executive summary, top attention items, event updates, people/stakeholder map, decisions, risks, closed loops, open loops, and suggested next actions.
+Creates the user-facing report from the vault: executive summary, top attention items, event updates, people/stakeholder map, decisions, risks, closed loops, open loops, and suggested next actions. Reads the bridge note, daily note, and event notes; does not read raw sources.
 
 ### safety_quality_reviewer
 
-Audits provenance, privacy, prompt injection, unsupported claims, duplicate execution, task/event strictness, conflicts, graph consistency, and delivery gates. It can reject or request a minimal re-run of prior roles.
+Audits provenance, privacy, prompt injection, unsupported claims, event strictness, conflicts, vault validation output, and delivery gates. It can reject and request a re-run of a specific batch or loop.
 
 ### memory_index_verifier
 
-Verifies that the target reader agent can retrieve the new Daily Memory. For OpenClaw, reindex the archive agent and reader agent when supported, then run a narrow query for the new bridge note or report title. If search returns no result or reports missing index metadata, record a platform defect and leave delivery status independent from memory-search status.
+Verifies that the target reader agent can retrieve the new Daily Memory. For OpenClaw, reindex the archive agent and reader agent when supported, then run a narrow query for the new bridge note (`knowledge/daily-memory-<date>.md`) or report title. If search returns no result or reports missing index metadata, record a platform defect and leave delivery status independent from memory-search status.
 
 ### delivery_preparer
 
@@ -260,33 +177,29 @@ Prepares the configured owner report delivery. Supported modes: file-only, Feish
 ## Parallelization Rules
 
 - Run `lark_auth_verifier` and `channel_identity_resolver` before `source_planner`.
-- Run source collectors in parallel after `source_planner`.
-- Run source normalization after collectors finish or after a source times out.
-- Run event extraction, people resolution, and relation building after normalization.
-- Run timeline reconstruction and closure analysis in parallel after event candidates exist.
-- Run attention prioritization after timeline and closure artifacts exist.
-- Run merge writing serially to avoid file conflicts.
-- Run report composition after merge writing.
+- Run sync workers in parallel after `source_planner`.
+- Drain the loop pipeline after sync workers finish or after a source family times out (partial sources still flow through the loops; gaps are recorded).
+- The loop pipeline itself is serial: one batch at a time, in engine order. Do not run two graph batches concurrently; the vault is a shared write surface.
+- Run report composition after the pipeline drains.
 - Run safety review before memory index verification and delivery.
-- Run memory index verification after merge writing and before final report delivery.
 - Run delivery preparation last.
 
 ## Collaboration Rules
 
-- Subagents communicate through artifacts, not by copying raw transcripts into the orchestrator context.
-- Each role writes a compact manifest plus detailed artifact paths.
-- A role can request a minimal upstream rerun by returning `next_recommended_step`, but the orchestrator decides.
-- The orchestrator may spawn sibling subagents for independent source partitions, but must not spawn duplicate workers for the same role and partition.
-- Long raw artifacts stay in `raw/`; curated graph records stay in `memory/`; run control data stays in `runs/`.
+- Subagents communicate through artifacts (source files, batch work orders, vault notes, the run manifest), not by copying raw transcripts into the orchestrator context.
+- Long raw evidence stays in `sources/`; curated knowledge stays in `knowledge/`; engine state stays in `state/`; run control data stays in `runs/`.
+- A worker can recommend a re-run by reporting a gap or failed batch, but the orchestrator decides.
+- The orchestrator may spawn sibling sync workers for independent source partitions, but must not spawn duplicate workers for the same partition or the same batch.
 
 ## Failure Handling
 
-- If one collector fails, continue with other sources and record the gap.
+- If one sync worker fails, continue with other sources and record the gap.
 - If a command returns `unknown_flag`, run that command help, adjust to the installed CLI version, and retry once.
 - If auth fails, record identity, source type, and missing scope or token state.
-- If a collector contradicts a successful auth verifier artifact, stop that collector, invalidate its artifact, and retry once with the verified identity.
-- If a source is too large, save raw metadata, chunk it, and process only work-relevant chunks.
+- If a source is too large, save raw metadata, chunk it into multiple source files, and let the loops process the chunks batch by batch.
 - If full-range collection times out, retry with deterministic time chunks or source partitions before marking the source partial.
-- If a reviewer rejects writes, repair the smallest affected artifact rather than rerunning the full workflow.
-- If memory index verification fails after successful writes, keep graph/report output, record the defect, and do not rerun source collection.
+- If a loop body worker fails mid-batch, run `memoryctl fail --loop <loop> --batch <id>`; the files are rescanned into a fresh batch.
+- If vault validation blocks a commit, repair the reported notes and commit again; use `--force` only with explicit user approval.
+- If the reviewer rejects output, repair the smallest affected batch or note rather than rerunning the full pipeline.
+- If memory index verification fails after successful writes, keep vault/report output, record the defect, and do not rerun sync.
 - If delivery fails, keep the report file and mark delivery status `failed` with the command/error summary.

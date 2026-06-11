@@ -192,7 +192,7 @@ Collect metadata and text previews for materials referenced by messages, docs, o
 - PDFs or office files when export is allowed
 - External links, preserving URL and page title
 
-Avoid downloading large binary content by default. Save metadata and extracted text under `raw/YYYY-MM-DD/feishu_materials/`.
+Avoid downloading large binary content by default. Save metadata and extracted text as source files under `sources/feishu_materials/`.
 
 ## Meetings And Minutes
 
