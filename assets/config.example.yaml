@@ -19,9 +19,10 @@ run:
     resume_partial_runs: true
     force: false
   concurrency:
-    max_parallel_collectors: 6
-    max_parallel_processors: 3
-    collector_timeout_seconds: 240
+    max_parallel_sync_loops: 6
+    sync_timeout_seconds: 240
+    # LLM loop batches (classify/graph/attention) run serially by design;
+    # the vault is a shared write surface.
   stability:
     require_lark_auth_verifier: true
     require_channel_identity_resolver: true
@@ -38,16 +39,41 @@ memory:
   shared_readers:
     - agent_id: main
       mode: memorySearch.extraPaths
-      path: /home/botinkit/.openclaw/workspace-daily-memory/memory
+      path: /home/botinkit/.openclaw/workspace-daily-memory/knowledge
   hermes_home: ~/.hermes
   codex_memory_root: ~/.codex/memories
   promote_to_native_long_term: confirmation_required
   keep_raw_evidence_days: 30
-  confidence_threshold_for_event_graph: 0.72
+  confidence_threshold_for_vault_promotion: 0.72
   confidence_threshold_for_native_memory: 0.9
-  write_root_bridge_note: true
   verify_reader_search_after_write: true
   reader_search_failure_policy: record_defect_and_continue_delivery
+
+# Loop engine (tools/memoryctl) configuration. Each stage is a small,
+# idempotent, stateful loop; see references/loop-engineering.md.
+loops:
+  steps: [classify, graph, attention, index]
+  batch_size: 25
+  state_dir: state
+  sources_dir: sources
+  vault_dir: knowledge
+  index_dir: index
+  classify:
+    enabled: true
+    prompt: prompts/classify_source.md
+  graph:
+    enabled: true
+    prompt: prompts/note_creation.md
+    validate_on_commit: true
+  attention:
+    enabled: true
+    prompt: prompts/attention.md
+    due_soon_days: 3
+    stale_open_loop_days: 3
+  index:
+    enabled: true
+    write_bridge_note: true
+    attention_threshold: 0.75
 
 lark:
   cli: lark-cli
@@ -107,8 +133,9 @@ extraction:
     - source_refs
     - confidence
 
-event_graph:
-  root: ./memory/graph
+vault:
+  root: ./knowledge
+  folders: [Events, People, Organizations, Projects, Topics, Daily]
   merge_duplicates: true
   duplicate_threshold: 0.82
   event_statuses:
@@ -120,10 +147,6 @@ event_graph:
     - cancelled
     - stale
     - needs_confirmation
-  attention_scoring:
-    deadline_half_life_days: 3
-    stale_open_loop_days: 3
-    high_attention_threshold: 0.75
 
 change_detection:
   triggers:
