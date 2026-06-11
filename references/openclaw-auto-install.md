@@ -2,9 +2,15 @@
 
 Use this guide when an OpenClaw agent should install, configure, schedule, and verify `daily-memory-skill` automatically.
 
+**Steps 1-2 (skill copy, link, workspace, bootstrap) are covered by the plugin installer** — prefer it and jump to step 3:
+
+```bash
+"$SOURCE_SKILL_DIR/install.sh" install openclaw
+```
+
 ## Target Result
 
-- One canonical skill copy at `~/.agents/skills/daily-memory-skill`.
+- One canonical skill copy in the share dir (default `/workspace/share-skills/daily-memory-skill`, fallback `~/.agents/skills/daily-memory-skill`).
 - OpenClaw skill link at `~/.openclaw/skills/daily-memory-skill`.
 - Dedicated `daily-memory` agent with workspace `~/.openclaw/workspace-daily-memory`.
 - Main agent can search curated Daily Memory through `memorySearch.extraPaths`.
@@ -42,7 +48,7 @@ if [ -e "$AGENT_HOME/skills/daily-memory-skill" ]; then
 fi
 
 mkdir -p "$AGENT_HOME/skills/daily-memory-skill"
-tar -C "$SOURCE_SKILL_DIR" -cf - SKILL.md README.md agents assets references \
+tar -C "$SOURCE_SKILL_DIR" -cf - SKILL.md README.md install.sh agents assets prompts references tools \
   | tar -C "$AGENT_HOME/skills/daily-memory-skill" -xf -
 
 mkdir -p "$OPENCLAW_HOME/skills"

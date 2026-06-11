@@ -2,9 +2,15 @@
 
 Use this guide when a Hermes agent should install and run `daily-memory-skill`. Hermes and OpenClaw can share the same canonical Daily Memory root, but Hermes should keep native memory compact.
 
+**Steps 1-2 (skill copy, link, workspace, bootstrap) are covered by the plugin installer** — prefer it and jump to step 3:
+
+```bash
+"$SOURCE_SKILL_DIR/install.sh" install hermes
+```
+
 ## Target Result
 
-- One canonical skill copy at `~/.agents/skills/daily-memory-skill`.
+- One canonical skill copy in the share dir (default `/workspace/share-skills/daily-memory-skill`, fallback `~/.agents/skills/daily-memory-skill`).
 - Hermes skill link at `~/.hermes/skills/daily-memory-skill`.
 - Canonical Daily Memory artifacts under `~/.hermes/daily-memory` or a shared root such as `~/.openclaw/workspace-daily-memory`.
 - Hermes native memory contains only pointers, durable user preferences, and high-confidence long-term rules.

@@ -2,12 +2,27 @@
 
 Use this runbook when an OpenClaw, Hermes, Codex, or generic agent needs to install or update `daily-memory-skill` automatically.
 
-For platform-specific automation, prefer:
+**Preferred path**: run the bundled plugin installer instead of executing the steps below by hand. It performs skill sync, platform symlinks, workspace init, bootstrap files, and verification in one idempotent command:
+
+```bash
+# from a checkout
+./install.sh install            # all detected platforms
+./install.sh install openclaw
+./install.sh install hermes
+./install.sh status | update | uninstall
+
+# remote one-liner (clones into the share dir)
+curl -fsSL https://raw.githubusercontent.com/junwayne66/daily-memory-skill/main/install.sh | bash -s -- install
+```
+
+Defaults: share dir `/workspace/share-skills` (fallback `~/.agents/skills`), OpenClaw home `~/.openclaw`, Hermes home `~/.hermes`; override with `--share-dir/--openclaw-home/--hermes-home` or `DAILY_MEMORY_SHARE_DIR/OPENCLAW_HOME/HERMES_HOME`.
+
+The installer covers filesystem state only. Platform configuration (agent registration, `memorySearch.extraPaths`, Feishu channel, cron) still follows:
 
 - [openclaw-auto-install.md](openclaw-auto-install.md) for OpenClaw.
 - [hermes-auto-install.md](hermes-auto-install.md) for Hermes.
 
-This file keeps the shared model, target layout, and rollback rules.
+The rest of this file keeps the shared model, target layout, and rollback rules for manual or custom installs.
 
 ## Goals
 
@@ -38,34 +53,22 @@ main_agent_id: "main"
 ## Target Layout
 
 ```text
-~/.agents/skills/daily-memory-skill/
-~/.openclaw/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
-~/.hermes/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
+/workspace/share-skills/daily-memory-skill/        # canonical copy (or ~/.agents/skills)
+~/.openclaw/skills/daily-memory-skill -> canonical
+~/.hermes/skills/daily-memory-skill   -> canonical
 
-~/.openclaw/workspace-daily-memory/
+~/.openclaw/workspace-daily-memory/                # created by memoryctl init
   AGENTS.md
   MEMORY.md
-  TOOLS.md
-  IDENTITY.md
-  USER.md
-  HEARTBEAT.md
+  sources/<family>/
+  knowledge/
+    Events/  People/  Organizations/  Projects/  Topics/  Daily/
+  state/
+  index/
   runs/
-  raw/
-  memory/
-    daily/
-    graph/
-      events/
-      people/
-      documents/
-      edges.yaml
-    attention/
-    projects/
-    tasks/
-    decisions/
-    risks/
-    people/
-    glossary/
   reports/
+
+~/.hermes/daily-memory/                            # same layout for Hermes
 ```
 
 ## Idempotent Install Steps
@@ -94,7 +97,7 @@ fi
 
 ```bash
 mkdir -p "$agent_home/skills/daily-memory-skill"
-tar -C "$source_skill_dir" -cf - SKILL.md agents assets references \
+tar -C "$source_skill_dir" -cf - SKILL.md install.sh agents assets prompts references tools \
   | tar -C "$agent_home/skills/daily-memory-skill" -xf -
 ```
 

@@ -47,6 +47,7 @@ flowchart LR
 daily-memory-skill/
   SKILL.md
   README.md
+  install.sh                # 插件式一键安装器(openclaw/hermes)
   agents/
     openai.yaml
   assets/
@@ -101,23 +102,57 @@ Daily Memory 使用多层记忆：
 
 ## 安装方式
 
-自动安装总入口见 [references/agent-installation.md](references/agent-installation.md)。平台细节见：
+### 一键安装(推荐)
 
-- [references/openclaw-auto-install.md](references/openclaw-auto-install.md)：OpenClaw 自动安装、daily-memory agent、Feishu channel、cron、main agent memory 检索验证。
-- [references/hermes-auto-install.md](references/hermes-auto-install.md)：Hermes 自动安装、外部 Daily Memory 根目录、Hermes native memory 指针、调度与 subagent 编排。
+仓库根目录提供插件式安装器 [install.sh](install.sh)，效果等同于 `/plugin install daily-memory-skill`：
 
-典型安装目标：
+```bash
+# 在已 checkout 的仓库内，自动检测 OpenClaw / Hermes 并全部安装
+./install.sh install
+
+# 只装某个平台
+./install.sh install openclaw
+./install.sh install hermes
+
+# 无 checkout 的远程一键安装(自动 git clone 到共享目录)
+curl -fsSL https://raw.githubusercontent.com/junwayne66/daily-memory-skill/main/install.sh | bash -s -- install
+
+# 查看安装状态 / 更新 / 卸载(保留数据)
+./install.sh status
+./install.sh update
+./install.sh uninstall
+```
+
+安装器做的事情：
+
+1. 把 skill 同步成**一份 canonical 副本**(默认 `/workspace/share-skills/daily-memory-skill`，无 `/workspace` 时退回 `~/.agents/skills/`)。
+2. 为每个平台建立 symlink：`~/.openclaw/skills/daily-memory-skill` 和 `~/.hermes/skills/daily-memory-skill` 都指向 canonical 副本，一次 `update` 全平台生效。
+3. 用 `memoryctl init` 初始化各平台工作区(OpenClaw: `~/.openclaw/workspace-daily-memory`；Hermes: `~/.hermes/daily-memory`)，写入 `AGENTS.md`/`MEMORY.md` bootstrap(仅缺失时)。
+4. 自动校验 symlink、工作区与引擎可用性，输出后续手工步骤(agent 注册、extraPaths、cron)。
+
+路径可用 `--share-dir`、`--openclaw-home`、`--hermes-home` 覆盖，或设置 `DAILY_MEMORY_SHARE_DIR`、`OPENCLAW_HOME`、`HERMES_HOME` 环境变量。
+
+### 手工/定制安装
+
+细节见 [references/agent-installation.md](references/agent-installation.md)。平台细节见：
+
+- [references/openclaw-auto-install.md](references/openclaw-auto-install.md)：OpenClaw 安装、daily-memory agent、Feishu channel、cron、main agent memory 检索验证。
+- [references/hermes-auto-install.md](references/hermes-auto-install.md)：Hermes 安装、外部 Daily Memory 根目录、Hermes native memory 指针、调度与 subagent 编排。
+
+安装后目录结构：
 
 ```text
-~/.agents/skills/daily-memory-skill/
-~/.openclaw/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
-~/.hermes/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
+/workspace/share-skills/daily-memory-skill/        # canonical 副本
+~/.openclaw/skills/daily-memory-skill -> canonical
+~/.hermes/skills/daily-memory-skill   -> canonical
+~/.openclaw/workspace-daily-memory/                # OpenClaw 工作区
+~/.hermes/daily-memory/                            # Hermes 工作区
 ```
 
 OpenClaw 推荐配置：
 
 - 新建 `daily-memory` agent，workspace 指向 `~/.openclaw/workspace-daily-memory`。
-- main agent 通过 `memorySearch.extraPaths` 读取 Daily Memory 的 `memory/` 目录。
+- main agent 通过 `memorySearch.extraPaths` 读取 Daily Memory 的 `knowledge/` 目录。
 - 每晚 `22:00 Asia/Shanghai` 触发 `daily-memory` agent。
 - 飞书 channel 的密钥放入 `~/.openclaw/.env`，不要写死在 `openclaw.json`。
 
