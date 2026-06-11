@@ -119,11 +119,15 @@ def scan(ws: Workspace, loop: str, batch_size: int = DEFAULT_BATCH_SIZE) -> dict
         return {"batch": None, "resumed": False, "remaining": 0}
 
     take = candidates[:batch_size]
+    # Uniquify with random bytes so a failed batch's audit record is never
+    # overwritten by a rescan within the same second.
     batch_id = "{}_{}_{}".format(
         loop,
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"),
-        short_hash("\n".join(f["path"] for f in take)),
+        short_hash("\n".join(f["path"] for f in take) + os.urandom(8).hex()),
     )
+    while os.path.exists(os.path.join(ws.batch_dir(loop), f"{batch_id}.json")):
+        batch_id = f"{batch_id}_{short_hash(os.urandom(8).hex())}"
     batch = {
         "batch_id": batch_id,
         "loop": loop,

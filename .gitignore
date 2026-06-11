@@ -12,11 +12,11 @@ __pycache__/
 .pytest_cache/
 
 # runtime workspace artifacts (never commit a live workdir into the skill repo)
-runs/
-raw/
-reports/
-memory/
-sources/
-knowledge/
-state/
-index/
+/runs/
+/raw/
+/reports/
+/memory/
+/sources/
+/knowledge/
+/state/
+/index/
