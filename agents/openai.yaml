@@ -1,0 +1,4 @@
+interface:
+  display_name: "Daily Memory"
+  short_description: "Build a Feishu/Lark personal event knowledge graph"
+  default_prompt: "Use $daily-memory-skill to collect today's authorized Feishu/Lark messages, docs, materials, calendar events, meetings, and minutes; update my personal event knowledge graph; identify attention items and open loops; and produce the owner report."
