@@ -287,7 +287,7 @@ cmd_install() {
         esac
     done
     [ "$failed" -eq 0 ] || die "verification failed"
-    log "Done. Run '$0 status' anytime to inspect the install."
+    log "Done. Run '$(canonical_dir)/install.sh status' anytime to inspect the install."
 }
 
 cmd_update() {
