@@ -2,12 +2,27 @@
 
 Use this runbook when an OpenClaw, Hermes, Codex, or generic agent needs to install or update `daily-memory-skill` automatically.
 
-For platform-specific automation, prefer:
+**Preferred path**: run the bundled plugin installer instead of executing the steps below by hand. It performs skill sync, platform symlinks, workspace init, bootstrap files, and verification in one idempotent command:
+
+```bash
+# from a checkout
+./install.sh install            # all detected platforms
+./install.sh install openclaw
+./install.sh install hermes
+./install.sh status | update | uninstall
+
+# remote one-liner (clones into the share dir)
+curl -fsSL https://raw.githubusercontent.com/junwayne66/daily-memory-skill/main/install.sh | bash -s -- install
+```
+
+Defaults: share dir `/workspace/share-skills` (fallback `~/.agents/skills`), OpenClaw home `~/.openclaw`, Hermes home `~/.hermes`; override with `--share-dir/--openclaw-home/--hermes-home` or `DAILY_MEMORY_SHARE_DIR/OPENCLAW_HOME/HERMES_HOME`.
+
+The installer covers filesystem state only. Platform configuration (agent registration, `memorySearch.extraPaths`, Feishu channel, cron) still follows:
 
 - [openclaw-auto-install.md](openclaw-auto-install.md) for OpenClaw.
 - [hermes-auto-install.md](hermes-auto-install.md) for Hermes.
 
-This file keeps the shared model, target layout, and rollback rules.
+The rest of this file keeps the shared model, target layout, and rollback rules for manual or custom installs.
 
 ## Goals
 
@@ -38,34 +53,22 @@ main_agent_id: "main"
 ## Target Layout
 
 ```text
-~/.agents/skills/daily-memory-skill/
-~/.openclaw/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
-~/.hermes/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
+/workspace/share-skills/daily-memory-skill/        # canonical copy (or ~/.agents/skills)
+~/.openclaw/skills/daily-memory-skill -> canonical
+~/.hermes/skills/daily-memory-skill   -> canonical
 
-~/.openclaw/workspace-daily-memory/
+~/.openclaw/workspace-daily-memory/                # created by memoryctl init
   AGENTS.md
   MEMORY.md
-  TOOLS.md
-  IDENTITY.md
-  USER.md
-  HEARTBEAT.md
+  sources/<family>/
+  knowledge/
+    Events/  People/  Organizations/  Projects/  Topics/  Daily/
+  state/
+  index/
   runs/
-  raw/
-  memory/
-    daily/
-    graph/
-      events/
-      people/
-      documents/
-      edges.yaml
-    attention/
-    projects/
-    tasks/
-    decisions/
-    risks/
-    people/
-    glossary/
   reports/
+
+~/.hermes/daily-memory/                            # same layout for Hermes
 ```
 
 ## Idempotent Install Steps
@@ -94,7 +97,7 @@ fi
 
 ```bash
 mkdir -p "$agent_home/skills/daily-memory-skill"
-tar -C "$source_skill_dir" -cf - SKILL.md agents assets references \
+tar -C "$source_skill_dir" -cf - SKILL.md install.sh agents assets prompts references tools \
   | tar -C "$agent_home/skills/daily-memory-skill" -xf -
 ```
 
@@ -112,21 +115,14 @@ ln -sfn "$agent_home/skills/daily-memory-skill" \
 
 ```bash
 daily_ws="$openclaw_home/workspace-daily-memory"
-mkdir -p \
-  "$daily_ws/runs" \
-  "$daily_ws/raw" \
-  "$daily_ws/reports" \
-  "$daily_ws/memory/daily" \
-  "$daily_ws/memory/graph/events" \
-  "$daily_ws/memory/graph/people" \
-  "$daily_ws/memory/graph/documents" \
-  "$daily_ws/memory/attention" \
-  "$daily_ws/memory/projects" \
-  "$daily_ws/memory/tasks" \
-  "$daily_ws/memory/decisions" \
-  "$daily_ws/memory/risks" \
-  "$daily_ws/memory/people" \
-  "$daily_ws/memory/glossary"
+python3 "$agent_home/skills/daily-memory-skill/tools/memoryctl.py" \
+  --workdir "$daily_ws" init
+```
+
+This creates the loop workspace layout (`sources/`, `knowledge/` vault folders, `state/`, `index/`, `reports/`); add `runs/` for run manifests:
+
+```bash
+mkdir -p "$daily_ws/runs"
 ```
 
 6. Write bootstrap files if missing.
@@ -139,9 +135,9 @@ You are the dedicated Daily Memory archivist. Use `$daily-memory-skill` for ever
 
 Mission: collect authorized Feishu/Lark private chats, group chats, shared docs/materials, calendar events, meetings, and Feishu Minutes; transform them into a personal event knowledge graph; identify attention items and open loops; and prepare or deliver the owner report.
 
-Operate as an orchestrator, not a monolithic worker. Dynamically create short-lived subagents for source collection, normalization, event extraction, people resolution, graph building, timeline reconstruction, closure analysis, attention prioritization, merge writing, report composition, review, and delivery preparation.
+Operate as an orchestrator, not a monolithic worker. Run sync loops (short-lived subagents per source family) in parallel, then drain the loop pipeline with the deterministic engine: `memoryctl run --steps classify,graph,attention,index`, processing each batch it issues with the matching prompt from `prompts/`, and committing every batch.
 
-Read `references/subagent-workflow.md`, `references/schemas.md`, `references/lark-cli-ingestion.md`, and `references/safety-quality.md` from the skill before a real scheduled harvest.
+Read `references/loop-engineering.md`, `references/subagent-workflow.md`, `references/schemas.md`, `references/lark-cli-ingestion.md`, and `references/safety-quality.md` from the skill before a real scheduled harvest.
 
 Never notify third parties or update Feishu/Base records without explicit user approval. Owner report delivery is allowed only when configured.
 EOF
@@ -149,7 +145,7 @@ EOF
 cat > "$daily_ws/MEMORY.md" <<'EOF'
 # Daily Memory Bootstrap
 
-This workspace is the canonical Daily Memory archive. Keep this file short. Durable event details live under `memory/`; raw evidence lives under `raw/`; run control data lives under `runs/`; owner reports live under `reports/`.
+This workspace is the canonical Daily Memory archive. Keep this file short. The knowledge vault lives under `knowledge/`; raw evidence under `sources/`; loop engine state under `state/`; run control data under `runs/`; owner reports under `reports/`.
 EOF
 
 cat > "$daily_ws/TOOLS.md" <<'EOF'

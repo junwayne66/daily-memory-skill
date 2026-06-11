@@ -1,6 +1,8 @@
 # Daily Memory Skill
 
-`daily-memory-skill` 是一个面向 OpenClaw、Hermes Agent、Codex 及其他智能体平台的个人工作记忆技能。它的目标不是生成普通日报，而是把每天授权范围内的飞书/Lark 私聊、群聊、文档、材料、日程、会议、会议妙记、任务/Base 等信息，整理成可追溯、可更新、可检索的个人事件知识图谱，并把需要关注的事件、风险、进展和闭环状态汇总给用户。
+`daily-memory-skill` 是一个面向 OpenClaw、Hermes Agent、Codex 及其他智能体平台的个人工作记忆技能。它的目标不是生成普通日报，而是把每天授权范围内的飞书/Lark 私聊、群聊、文档、材料、日程、会议、会议妙记、任务/Base 等信息，整理成可追溯、可更新、可检索的个人知识图谱(Obsidian 兼容的 Markdown vault)，并把需要关注的事件、风险、进展和闭环状态汇总给用户。
+
+整体实现采用 **loop engineering** 设计(参考 [rowboat](https://github.com/rowboatlabs/rowboat) 的知识图谱流水线)：每个处理阶段是一个小型、幂等、有状态的循环，由确定性引擎 `tools/memoryctl` 驱动；LLM(宿主 agent)只在循环体内做判断。
 
 运行时入口是 [SKILL.md](SKILL.md)。本 README 面向人类维护者和自动化安装器，用于理解架构、配置、使用方式和稳定运行注意事项。
 
@@ -10,41 +12,34 @@
 - 以事件为中心沉淀目标、相关人、时间线、进展、结果、风险、决策、任务和闭环状态。
 - 保留每条记忆的证据来源、权限边界、时间戳和可信度。
 - 支持 main agent 通过原生 memory search 查询 Daily Memory 的积累。
-- 使用动态 subagent 拆分复杂工作流，降低上下文压力，提高稳定性和可恢复性。
+- 用增量循环代替一次性大批处理：成本随当日增量而非历史规模扩张，任何中断都可断点恢复。
 
 ## 架构设计
 
 ```mermaid
-flowchart TD
-  A["定时/手动触发 daily-memory agent"] --> B["run_guard"]
-  B --> C["lark_auth_verifier"]
-  C --> D["channel_identity_resolver"]
-  D --> E["source_planner"]
-  E --> F1["私聊采集"]
-  E --> F2["群聊采集"]
-  E --> F3["文档/知识库采集"]
-  E --> F4["材料/附件采集"]
-  E --> F5["日程采集"]
-  E --> F6["会议/妙记采集"]
-  E --> F7["任务/Base采集"]
-  F1 --> G["source_normalizer_deduper"]
-  F2 --> G
-  F3 --> G
-  F4 --> G
-  F5 --> G
-  F6 --> G
-  F7 --> G
-  G --> H["事件/人物/关系抽取"]
-  H --> I["时间线与闭环分析"]
-  I --> J["关注事项排序"]
-  J --> K["知识图谱合并写入"]
-  K --> L["报告生成"]
-  L --> M["安全质量审查"]
-  M --> N["memory_index_verifier"]
-  N --> O["飞书文档/私聊交付"]
+flowchart LR
+  subgraph pre [前置校验]
+    A["run_guard"] --> B["lark_auth_verifier"] --> C["channel_identity_resolver"]
+  end
+  subgraph syncLoops [Sync Loops 并行]
+    S1["私聊/群聊 sync"]
+    S2["文档/材料 sync"]
+    S3["日程/会议/妙记 sync"]
+    S4["任务/Base sync"]
+  end
+  pre --> syncLoops
+  syncLoops --> SRC["sources/ 源文件(带溯源 frontmatter)"]
+  SRC --> CL["Classify Loop 相关性分类(LLM 循环体)"]
+  CL --> GR["Graph Build Loop 实体抽取与合并(LLM 循环体)"]
+  GR --> VAULT["knowledge/ Markdown Vault(wikilink 即图谱边)"]
+  VAULT --> AT["Attention Loop 关注度评分(LLM 循环体)"]
+  AT --> IX["Index Loop 反链索引与桥接笔记(确定性)"]
+  IX --> RPT["报告生成 + 安全审查 + 检索验证 + 交付"]
 ```
 
-主 agent 只做编排、验收和最终报告。采集、清洗、抽取、合并、审查、发送等步骤由短生命周期 subagent 完成。subagent 不常驻、不拥有长期记忆，只通过 `runs/`、`raw/`、`memory/`、`reports/` 下的结构化产物协作。
+每个 loop 遵循同一骨架：`scan(增量检测) → take batch(小批量) → process(循环体) → write → commit(持久化状态)`。引擎用 mtime+hash 双重校验做增量检测，每批提交后立即落盘状态；`memoryctl run` 在第一个仍有待处理工作的 LLM loop 处停下并输出 `next_action`，agent 处理该批并 commit 后再次调用，直到 `done`。详见 [references/loop-engineering.md](references/loop-engineering.md) 与 [tools/README.md](tools/README.md)。
+
+主 agent 只做编排、循环体执行(或委派给短生命周期 subagent)和最终报告。采集由并行 sync worker 完成；分类、建图、关注度由 loop body worker 按批完成；索引与桥接笔记由引擎确定性生成。
 
 ## 目录结构
 
@@ -52,11 +47,21 @@ flowchart TD
 daily-memory-skill/
   SKILL.md
   README.md
+  install.sh                # 插件式一键安装器(openclaw/hermes)
   agents/
     openai.yaml
   assets/
     config.example.yaml
+  prompts/                  # LLM 循环体提示词
+    classify_source.md
+    note_creation.md
+    attention.md
+  tools/                    # 确定性循环引擎(Python 3, 零依赖)
+    memoryctl.py
+    memoryctl/
+    tests/
   references/
+    loop-engineering.md
     agent-installation.md
     openclaw-auto-install.md
     hermes-auto-install.md
@@ -67,58 +72,87 @@ daily-memory-skill/
     subagent-workflow.md
 ```
 
-建议的 OpenClaw 运行工作区：
+运行工作区(`memoryctl init` 创建，例如 OpenClaw)：
 
 ```text
 ~/.openclaw/workspace-daily-memory/
   MEMORY.md
-  runs/YYYY-MM-DD/
-  raw/YYYY-MM-DD/
-  memory/
-    daily/
-    graph/
-    attention/
-    tasks/
-    decisions/
-    risks/
-    people/
-    projects/
-    daily-memory-YYYY-MM-DD.md
+  sources/<family>/YYYY-MM-DD__<id>.md   # 同步的原始证据
+  knowledge/                              # 知识图谱 vault(Obsidian 兼容)
+    Events/  People/  Organizations/  Projects/  Topics/  Daily/
+    daily-memory-YYYY-MM-DD.md            # 引擎生成的桥接笔记
+  state/                                  # loop 状态与批次工作单
+  index/edges.json                        # 派生的 wikilink 边索引
+  runs/YYYY-MM-DD/run_manifest.yaml
   reports/YYYY-MM-DD.md
 ```
 
-其中 `memory/*.md` 是给 main agent 检索用的浅层桥接记忆；深层 YAML/JSON 图谱文件是确定性状态源。
+`knowledge/` 既是事实源也是检索面：每个实体一个带 frontmatter 的 Markdown 笔记，`[[wikilink]]` 即图谱边；`index/edges.json` 由引擎从 wikilink 确定性重建。
 
 ## 记忆模型
 
 Daily Memory 使用多层记忆：
 
-- **Raw evidence**：原始消息、文档导出、会议记录、命令输出、采集快照。只作为证据，不直接进入长期记忆。
-- **Run ledger**：每次运行的 manifest、角色状态、输入 hash、重试记录、交付状态。
-- **Daily memory**：每日观察、事件变化、关键结论和 source refs。
-- **Event knowledge graph**：事件、人物、文档、任务、决策、风险、关系边。
-- **Reader bridge note**：写在 `memory/*.md` 的紧凑 Markdown，用于 OpenClaw main agent 检索。
-- **Native long-term memory**：只保存高置信、长期有用、可复用的规则和偏好。
+- **Raw evidence**(`sources/`)：原始消息、文档导出、会议记录的 Markdown 快照，frontmatter 保留溯源信息。只作为证据，不直接进入长期记忆。
+- **Loop state**(`state/`)：每个 loop 的已处理文件清单(mtime+hash)与批次工作单，引擎管理。
+- **Run ledger**(`runs/`)：每次运行的 manifest、auth 证明、sync 状态、loop 统计、交付状态。
+- **Knowledge vault**(`knowledge/`)：事件、人物、组织、项目、主题笔记 + 每日 episodic 笔记，是事实源。
+- **Bridge note**(`knowledge/daily-memory-*.md`)：`memoryctl index` 确定性生成的紧凑摘要，供浅层检索。
+- **Native long-term memory**(`MEMORY.md`)：只保存高置信、长期有用、可复用的规则和偏好。
 
 ## 安装方式
 
-自动安装总入口见 [references/agent-installation.md](references/agent-installation.md)。平台细节见：
+### 一键安装(推荐)
 
-- [references/openclaw-auto-install.md](references/openclaw-auto-install.md)：OpenClaw 自动安装、daily-memory agent、Feishu channel、cron、main agent memory 检索验证。
-- [references/hermes-auto-install.md](references/hermes-auto-install.md)：Hermes 自动安装、外部 Daily Memory 根目录、Hermes native memory 指针、调度与 subagent 编排。
+仓库根目录提供插件式安装器 [install.sh](install.sh)，效果等同于 `/plugin install daily-memory-skill`：
 
-典型安装目标：
+```bash
+# 在已 checkout 的仓库内，自动检测 OpenClaw / Hermes 并全部安装
+./install.sh install
+
+# 只装某个平台
+./install.sh install openclaw
+./install.sh install hermes
+
+# 无 checkout 的远程一键安装(自动 git clone 到共享目录)
+curl -fsSL https://raw.githubusercontent.com/junwayne66/daily-memory-skill/main/install.sh | bash -s -- install
+
+# 查看安装状态 / 更新 / 卸载(保留数据)
+./install.sh status
+./install.sh update
+./install.sh uninstall
+```
+
+安装器做的事情：
+
+1. 把 skill 同步成**一份 canonical 副本**(默认 `/workspace/share-skills/daily-memory-skill`，无 `/workspace` 时退回 `~/.agents/skills/`)。
+2. 为每个平台建立 symlink：`~/.openclaw/skills/daily-memory-skill` 和 `~/.hermes/skills/daily-memory-skill` 都指向 canonical 副本，一次 `update` 全平台生效。
+3. 用 `memoryctl init` 初始化各平台工作区(OpenClaw: `~/.openclaw/workspace-daily-memory`；Hermes: `~/.hermes/daily-memory`)，写入 `AGENTS.md`/`MEMORY.md` bootstrap(仅缺失时)。
+4. 自动校验 symlink、工作区与引擎可用性，输出后续手工步骤(agent 注册、extraPaths、cron)。
+
+路径可用 `--share-dir`、`--openclaw-home`、`--hermes-home` 覆盖，或设置 `DAILY_MEMORY_SHARE_DIR`、`OPENCLAW_HOME`、`HERMES_HOME` 环境变量。
+
+### 手工/定制安装
+
+细节见 [references/agent-installation.md](references/agent-installation.md)。平台细节见：
+
+- [references/openclaw-auto-install.md](references/openclaw-auto-install.md)：OpenClaw 安装、daily-memory agent、Feishu channel、cron、main agent memory 检索验证。
+- [references/hermes-auto-install.md](references/hermes-auto-install.md)：Hermes 安装、外部 Daily Memory 根目录、Hermes native memory 指针、调度与 subagent 编排。
+
+安装后目录结构：
 
 ```text
-~/.agents/skills/daily-memory-skill/
-~/.openclaw/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
-~/.hermes/skills/daily-memory-skill -> ~/.agents/skills/daily-memory-skill
+/workspace/share-skills/daily-memory-skill/        # canonical 副本
+~/.openclaw/skills/daily-memory-skill -> canonical
+~/.hermes/skills/daily-memory-skill   -> canonical
+~/.openclaw/workspace-daily-memory/                # OpenClaw 工作区
+~/.hermes/daily-memory/                            # Hermes 工作区
 ```
 
 OpenClaw 推荐配置：
 
 - 新建 `daily-memory` agent，workspace 指向 `~/.openclaw/workspace-daily-memory`。
-- main agent 通过 `memorySearch.extraPaths` 读取 Daily Memory 的 `memory/` 目录。
+- main agent 通过 `memorySearch.extraPaths` 读取 Daily Memory 的 `knowledge/` 目录。
 - 每晚 `22:00 Asia/Shanghai` 触发 `daily-memory` agent。
 - 飞书 channel 的密钥放入 `~/.openclaw/.env`，不要写死在 `openclaw.json`。
 
@@ -129,7 +163,9 @@ OpenClaw 推荐配置：
 - `run.schedule`：默认 `0 22 * * *`
 - `run.stability.require_lark_auth_verifier`：真实采集前验证 lark-cli 授权
 - `run.stability.require_channel_identity_resolver`：发送前解析当前 bot 的 owner peer
-- `memory.write_root_bridge_note`：写入浅层 Markdown 桥接记忆
+- `loops.steps`：流水线顺序，默认 `[classify, graph, attention, index]`
+- `loops.batch_size`：每批处理的文件数，默认 25(长转录可调小)
+- `loops.index.attention_threshold`：进入桥接笔记 Top Attention 的分数阈值
 - `memory.verify_reader_search_after_write`：写入后验证 main agent 是否能检索
 - `lark.auth_policy.never_login_when_user_token_ready`：user token 可用时禁止误触发重新登录
 - `report.delivery.mode`：`file`、`feishu_doc`、`feishu_private_message` 或 `both`
@@ -152,7 +188,8 @@ cron payload 应明确要求：
 - 先执行 `run_guard`
 - 再执行 `lark_auth_verifier`
 - 再执行 `channel_identity_resolver`
-- 之后才允许 source collectors 并行采集
+- 之后才允许 sync loop 并行采集到 `sources/`
+- 然后用 `memoryctl run --steps classify,graph,attention,index` 排空流水线(逐批处理并 commit)
 - 写入后必须执行 `memory_index_verifier`
 
 ### 手动全量回灌
@@ -162,12 +199,11 @@ cron payload 应明确要求：
 ```text
 Use $daily-memory-skill to run a historical backfill before 2026-06-10.
 Use authorized Feishu/Lark private chats, group chats, calendar, meetings, minutes, docs, materials, tasks/Base when configured.
-Clear or isolate previous Daily Memory artifacts only when the user explicitly confirms.
-Write graph files, root bridge note, and owner report.
+Sync the historical window into sources/, then drain the loop pipeline batch by batch.
 Verify main memory search after indexing.
 ```
 
-全量回灌应启用分片：
+回灌不需要特殊模式：sync loop 把历史窗口写入 `sources/` 后，同一条增量流水线会按批排空积压(状态逐批落盘，可随时中断续跑)。sync 分片建议：
 
 - 消息按 chat 分片。
 - 日程按月或季度分片。
@@ -176,7 +212,7 @@ Verify main memory search after indexing.
 
 ### 查询支持
 
-main agent 回答用户问题时，应优先检索 Daily Memory 的 curated memory 和 graph bridge note，而不是直接读取原始私聊全文。只有当用户明确要求追溯证据时，才回到 source refs。
+main agent 回答用户问题时，应优先检索 `knowledge/` vault 中的实体笔记和桥接笔记，而不是直接读取原始私聊全文。只有当用户明确要求追溯证据时，才顺着笔记的 `source_refs` 回到 `sources/` 下的源文件。
 
 ## 飞书/Lark 接入
 
@@ -241,13 +277,13 @@ Streaming 卡片适合实时 UI 体验，但部分 API/CLI 回读只会返回片
 
 ## 稳定性策略
 
-- 每次运行都有唯一 `run_id`、窗口、配置 hash 和 source cursor。
-- 同一配置下已完成的 run 不重复执行。
-- partial run 只重跑失败角色或失败分片。
-- 每个 collector 最多重试三次。
-- 大范围查询失败时进行确定性分片。
+- 每次运行都有唯一 `run_id`、窗口和配置 hash；loop 状态文件让重复运行天然变成 no-op。
+- 增量检测用 mtime+hash 双重校验：只改 mtime 不改内容的文件会被跳过。
+- 每批提交后立即持久化状态，中断最多损失一个在途批次，scan 会原样重发。
+- pending 批次之间不会出现同一文件，杜绝重复处理。
+- 每个 sync worker 最多重试三次；大范围查询失败时进行确定性分片。
 - 单个文档、会议或附件超时不能拖垮整次运行。
-- 写 graph 时只追加或生成 conflict，不静默覆盖旧事实。
+- 写 vault 时只追加或生成 `## Conflicts`，不静默覆盖旧事实；graph/attention 的 commit 先过 schema 校验。
 - 发送前必须经过安全质量审查。
 - 第三方通知、Base/任务写回默认禁止，必须用户确认。
 
@@ -255,12 +291,12 @@ Streaming 卡片适合实时 UI 体验，但部分 API/CLI 回读只会返回片
 
 一次成功运行至少应产出：
 
-- `runs/<date>/run_manifest.yaml`
-- `raw/<date>/...`
-- `memory/daily/<date>.md`
-- `memory/*.md` root bridge note
-- `memory/graph/...`
-- `memory/attention/...`
+- `runs/<date>/run_manifest.yaml`(含 loop 统计)
+- `sources/<family>/...` 源文件(带 relevance 标注)
+- `knowledge/` vault 笔记更新(Events/People/Projects/...)
+- `knowledge/Daily/<date>.md` 每日笔记
+- `knowledge/daily-memory-<date>.md` 桥接笔记(引擎生成)
+- `index/edges.json` 边索引(引擎生成)
 - `reports/<date>.md`
 - 可选：飞书文档、飞书私聊摘要
 
@@ -299,7 +335,7 @@ openclaw memory search --agent main "Daily Memory" --max-results 5 --json
 
 1. 飞书用户在当前 bot 私聊发送 `MSR的工作原理`。
 2. OpenClaw Feishu gateway 收到消息并路由到 main agent。
-3. main agent 调用 `memory_search`，命中 Daily Memory 的 `memory/daily-memory-msr-work-principle.md` 桥接记忆。
+3. main agent 调用 `memory_search`，命中 Daily Memory 的桥接记忆(该链路验证时位于 `memory/daily-memory-msr-work-principle.md`；当前架构下为 `knowledge/daily-memory-<date>.md`)。
 4. main agent 调用 `memory_get` 读取桥接记忆全文。
 5. main agent 生成带 `Source: Daily Memory Bridge - MSR 工作原理` 的回答。
 6. Feishu channel 以普通 `post` 消息发送给用户，并可通过 `lark-cli im +chat-messages-list` 完整回读。
@@ -314,10 +350,11 @@ openclaw memory search --agent main "Daily Memory" --max-results 5 --json
 
 ## 维护建议
 
-- 保持 `SKILL.md` 精简，把平台安装、subagent 细节、schema 和安全策略放在 `references/`。
-- OpenClaw 和 Hermes 共用一个 canonical skill copy，避免多份 skill 漂移。
-- Daily Memory graph 是事实源，native memory 只保存桥接摘要和高置信长期规则。
-- OpenClaw main agent 读取 Daily Memory 时，优先用 `memorySearch.extraPaths`，不要为了共享记忆把 main workspace 和 daily-memory workspace 合并。
+- 保持 `SKILL.md` 精简，把 loop 协议、平台安装、schema 和安全策略放在 `references/`，把循环体提示词放在 `prompts/`。
+- OpenClaw 和 Hermes 共用一个 canonical skill copy(含 `tools/` 引擎)，避免多份 skill 漂移。
+- `knowledge/` vault 是事实源，native memory 只保存指针和高置信长期规则；`state/` 与 `index/` 是引擎派生数据，不要手工编辑。
+- 修改引擎后运行 `cd tools && python3 -m pytest tests/` 验证增量检测与断点恢复行为。
+- OpenClaw main agent 读取 Daily Memory 时，优先用 `memorySearch.extraPaths` 指向 `knowledge/`，不要为了共享记忆把 main workspace 和 daily-memory workspace 合并。
 - 每次变更 Feishu bot/app 后，必须重新解析 active channel peer 并跑一次 owner-only E2E。
 - 每次变更 memory provider/embedding 配置后，必须强制重建 daily-memory 与 reader agent 的索引，并用 reader agent 查询验证。
 
@@ -335,11 +372,14 @@ openclaw memory search --agent main "Daily Memory" --max-results 5 --json
 ## 参考文档
 
 - [SKILL.md](SKILL.md)：技能运行时入口。
+- [references/loop-engineering.md](references/loop-engineering.md)：loop 骨架、批次协议、状态文件、断点恢复。
+- [tools/README.md](tools/README.md)：memoryctl 循环引擎命令与行为。
+- [prompts/](prompts/)：classify/graph/attention 循环体提示词。
 - [references/agent-installation.md](references/agent-installation.md)：跨平台代理人自动安装总 runbook。
 - [references/openclaw-auto-install.md](references/openclaw-auto-install.md)：OpenClaw 自动安装指导。
 - [references/hermes-auto-install.md](references/hermes-auto-install.md)：Hermes 自动安装指导。
-- [references/subagent-workflow.md](references/subagent-workflow.md)：动态 subagent 编排。
+- [references/subagent-workflow.md](references/subagent-workflow.md)：sync worker 与 loop body worker 的 subagent 编排。
 - [references/lark-cli-ingestion.md](references/lark-cli-ingestion.md)：飞书/Lark 数据采集与交付。
 - [references/memory-adapters.md](references/memory-adapters.md)：OpenClaw/Hermes/Codex 记忆适配。
-- [references/schemas.md](references/schemas.md)：事件图谱与运行产物 schema。
+- [references/schemas.md](references/schemas.md)：工作区布局、vault 笔记与运行产物 schema。
 - [references/safety-quality.md](references/safety-quality.md)：安全、隐私、幂等和质量门禁。

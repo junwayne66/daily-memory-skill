@@ -2,9 +2,15 @@
 
 Use this guide when an OpenClaw agent should install, configure, schedule, and verify `daily-memory-skill` automatically.
 
+**Steps 1-2 (skill copy, link, workspace, bootstrap) are covered by the plugin installer** — prefer it and jump to step 3:
+
+```bash
+"$SOURCE_SKILL_DIR/install.sh" install openclaw
+```
+
 ## Target Result
 
-- One canonical skill copy at `~/.agents/skills/daily-memory-skill`.
+- One canonical skill copy in the share dir (default `/workspace/share-skills/daily-memory-skill`, fallback `~/.agents/skills/daily-memory-skill`).
 - OpenClaw skill link at `~/.openclaw/skills/daily-memory-skill`.
 - Dedicated `daily-memory` agent with workspace `~/.openclaw/workspace-daily-memory`.
 - Main agent can search curated Daily Memory through `memorySearch.extraPaths`.
@@ -42,7 +48,7 @@ if [ -e "$AGENT_HOME/skills/daily-memory-skill" ]; then
 fi
 
 mkdir -p "$AGENT_HOME/skills/daily-memory-skill"
-tar -C "$SOURCE_SKILL_DIR" -cf - SKILL.md README.md agents assets references \
+tar -C "$SOURCE_SKILL_DIR" -cf - SKILL.md README.md install.sh agents assets prompts references tools \
   | tar -C "$AGENT_HOME/skills/daily-memory-skill" -xf -
 
 mkdir -p "$OPENCLAW_HOME/skills"
@@ -53,22 +59,12 @@ ln -sfn "$AGENT_HOME/skills/daily-memory-skill" \
 ## 2. Create The Daily Memory Workspace
 
 ```bash
-mkdir -p \
-  "$DAILY_WS/runs" \
-  "$DAILY_WS/raw" \
-  "$DAILY_WS/reports" \
-  "$DAILY_WS/memory/daily" \
-  "$DAILY_WS/memory/graph/events" \
-  "$DAILY_WS/memory/graph/people" \
-  "$DAILY_WS/memory/graph/documents" \
-  "$DAILY_WS/memory/attention" \
-  "$DAILY_WS/memory/projects" \
-  "$DAILY_WS/memory/tasks" \
-  "$DAILY_WS/memory/decisions" \
-  "$DAILY_WS/memory/risks" \
-  "$DAILY_WS/memory/people" \
-  "$DAILY_WS/memory/glossary"
+python3 "$OPENCLAW_HOME/skills/daily-memory-skill/tools/memoryctl.py" \
+  --workdir "$DAILY_WS" init
+mkdir -p "$DAILY_WS/runs"
 ```
+
+`memoryctl init` creates the loop workspace: `sources/` (synced evidence), `knowledge/` (the vault: Events/People/Organizations/Projects/Topics/Daily), `state/` (engine state), `index/`, and `reports/`.
 
 Write bootstrap files only if missing:
 
@@ -78,7 +74,7 @@ cat > "$DAILY_WS/AGENTS.md" <<'EOF'
 
 Use `$daily-memory-skill` for every scheduled archive run.
 
-You are an orchestrator. Create short-lived subagents for atomic roles: run guard, auth verification, channel identity, source planning, source collection, normalization, event extraction, people resolution, graph building, timeline/closure analysis, attention scoring, merge writing, report composition, safety review, memory index verification, and delivery preparation.
+You are an orchestrator. Run guards first (run guard, auth verification, channel identity, source planning), then parallel sync loop workers per source family, then drain the loop pipeline with `memoryctl run --steps classify,graph,attention,index`, processing and committing each batch the engine issues. Finish with report composition, safety review, memory index verification, and delivery preparation.
 
 Do not store raw transcripts in native long-term memory. Do not notify third parties or update Feishu/Base records without explicit user approval. Owner report delivery is allowed only when configured.
 EOF
@@ -86,7 +82,7 @@ EOF
 cat > "$DAILY_WS/MEMORY.md" <<'EOF'
 # Daily Memory Bootstrap
 
-Canonical Daily Memory archive. Keep this root file short. Durable details live under `memory/`; raw evidence under `raw/`; run control under `runs/`; reports under `reports/`.
+Canonical Daily Memory archive. Keep this root file short. The knowledge vault lives under `knowledge/`; raw evidence under `sources/`; loop engine state under `state/`; run control under `runs/`; reports under `reports/`.
 EOF
 
 cat > "$DAILY_WS/TOOLS.md" <<'EOF'
@@ -134,7 +130,7 @@ Patch by merging, not replacing whole arrays blindly. The final config should co
         id: "main",
         memorySearch: {
           extraPaths: [
-            "/home/botinkit/.openclaw/workspace-daily-memory/memory"
+            "/home/botinkit/.openclaw/workspace-daily-memory/knowledge"
           ]
         }
       },
@@ -245,10 +241,9 @@ Schedule expression: `0 22 * * *`, timezone `Asia/Shanghai`.
 OpenClaw agents should follow `references/subagent-workflow.md`:
 
 - The daily-memory agent is the orchestrator.
-- Subagents are temporary and receive a small YAML task envelope.
-- Source collectors run in parallel by source family and partition.
-- Merge writer, safety reviewer, memory verifier, and delivery preparer run serially.
-- Subagents write artifacts under `runs/YYYY-MM-DD/artifacts/`.
+- Subagents are temporary and receive a small task envelope (sync workers) or a batch work order (loop body workers).
+- Sync loop workers run in parallel by source family and partition; they write source files under `sources/<family>/`.
+- The loop pipeline runs serially, driven by `memoryctl run`; loop body workers process one batch at a time and finish with `memoryctl commit`.
 - No subagent writes native long-term memory or sends external notifications.
 - Every role returns status, artifacts, source refs, warnings, gaps, and next step.
 
@@ -259,10 +254,9 @@ run_guard
 -> lark_auth_verifier
 -> channel_identity_resolver
 -> source_planner
--> parallel collectors
--> source_normalizer_deduper
--> extractors/resolvers/builders
--> merge_writer
+-> parallel sync loop workers
+-> memoryctl run --steps classify,graph,attention,index
+     (classify/graph/attention batches processed and committed)
 -> report_composer
 -> safety_quality_reviewer
 -> memory_index_verifier

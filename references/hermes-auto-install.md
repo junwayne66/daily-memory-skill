@@ -2,9 +2,15 @@
 
 Use this guide when a Hermes agent should install and run `daily-memory-skill`. Hermes and OpenClaw can share the same canonical Daily Memory root, but Hermes should keep native memory compact.
 
+**Steps 1-2 (skill copy, link, workspace, bootstrap) are covered by the plugin installer** — prefer it and jump to step 3:
+
+```bash
+"$SOURCE_SKILL_DIR/install.sh" install hermes
+```
+
 ## Target Result
 
-- One canonical skill copy at `~/.agents/skills/daily-memory-skill`.
+- One canonical skill copy in the share dir (default `/workspace/share-skills/daily-memory-skill`, fallback `~/.agents/skills/daily-memory-skill`).
 - Hermes skill link at `~/.hermes/skills/daily-memory-skill`.
 - Canonical Daily Memory artifacts under `~/.hermes/daily-memory` or a shared root such as `~/.openclaw/workspace-daily-memory`.
 - Hermes native memory contains only pointers, durable user preferences, and high-confidence long-term rules.
@@ -39,7 +45,7 @@ if [ -e "$AGENT_HOME/skills/daily-memory-skill" ]; then
 fi
 
 mkdir -p "$AGENT_HOME/skills/daily-memory-skill"
-tar -C "$SOURCE_SKILL_DIR" -cf - SKILL.md README.md agents assets references \
+tar -C "$SOURCE_SKILL_DIR" -cf - SKILL.md README.md agents assets prompts references tools \
   | tar -C "$AGENT_HOME/skills/daily-memory-skill" -xf -
 
 mkdir -p "$HERMES_HOME/skills"
@@ -52,21 +58,9 @@ If Hermes uses a different skill registry path, keep the canonical copy in `~/.a
 ## 2. Create The Daily Memory Root
 
 ```bash
-mkdir -p \
-  "$DAILY_ROOT/runs" \
-  "$DAILY_ROOT/raw" \
-  "$DAILY_ROOT/reports" \
-  "$DAILY_ROOT/memory/daily" \
-  "$DAILY_ROOT/memory/graph/events" \
-  "$DAILY_ROOT/memory/graph/people" \
-  "$DAILY_ROOT/memory/graph/documents" \
-  "$DAILY_ROOT/memory/attention" \
-  "$DAILY_ROOT/memory/projects" \
-  "$DAILY_ROOT/memory/tasks" \
-  "$DAILY_ROOT/memory/decisions" \
-  "$DAILY_ROOT/memory/risks" \
-  "$DAILY_ROOT/memory/people" \
-  "$DAILY_ROOT/memory/glossary"
+python3 "$AGENT_HOME/skills/daily-memory-skill/tools/memoryctl.py" \
+  --workdir "$DAILY_ROOT" init
+mkdir -p "$DAILY_ROOT/runs"
 ```
 
 Bootstrap:
@@ -75,26 +69,26 @@ Bootstrap:
 cat > "$DAILY_ROOT/MEMORY.md" <<'EOF'
 # Daily Memory Bootstrap
 
-Canonical Daily Memory archive for Hermes. Raw evidence lives under `raw/`; graph state under `memory/graph`; bridge notes under `memory/*.md`; reports under `reports/`.
+Canonical Daily Memory archive for Hermes. Raw evidence lives under `sources/`; the knowledge vault under `knowledge/`; loop engine state under `state/`; bridge notes at `knowledge/daily-memory-YYYY-MM-DD.md`; reports under `reports/`.
 EOF
 ```
 
 ## 3. Hermes Native Memory Policy
 
-Do not put raw transcripts, full meeting minutes, or large graph files in Hermes native memory. Add only compact pointers like:
+Do not put raw transcripts, full meeting minutes, or large vault exports in Hermes native memory. Add only compact pointers like:
 
 ```markdown
-Daily Memory canonical root: /home/botinkit/.hermes/daily-memory. Search or read bridge notes under memory/*.md before answering project/event questions.
+Daily Memory canonical root: /home/botinkit/.hermes/daily-memory. Search or read the knowledge vault under knowledge/ (bridge notes: knowledge/daily-memory-YYYY-MM-DD.md) before answering project/event questions.
 ```
 
 If Hermes exposes memory commands, use them conservatively:
 
 ```bash
 "$HERMES_BIN" memory status || true
-"$HERMES_BIN" memory add "Daily Memory canonical root: $DAILY_ROOT. Use bridge notes in memory/*.md for recall." || true
+"$HERMES_BIN" memory add "Daily Memory canonical root: $DAILY_ROOT. Use the knowledge/ vault and its daily-memory bridge notes for recall." || true
 ```
 
-If Hermes has an external semantic memory provider, index `"$DAILY_ROOT/memory"` and keep source paths in every stored fact.
+If Hermes has an external semantic memory provider, index `"$DAILY_ROOT/knowledge"` and keep source paths in every stored fact.
 
 ## 4. Feishu/Lark Auth
 
@@ -126,31 +120,25 @@ orchestrator
   -> lark_auth_verifier
   -> channel_identity_resolver
   -> source_planner
-  -> parallel source collectors
-  -> source_normalizer_deduper
-  -> event_candidate_extractor
-  -> people_entity_resolver
-  -> relation_graph_builder
-  -> timeline_progress_reconstructor
-  -> closure_status_analyzer
-  -> attention_prioritizer
-  -> knowledge_graph_merge_writer
+  -> parallel sync loop workers
+  -> memoryctl run --steps classify,graph,attention,index
+       classify_loop_worker / graph_loop_worker / attention_loop_worker (per batch)
   -> report_composer
   -> safety_quality_reviewer
   -> memory_index_verifier
   -> delivery_preparer
 ```
 
-Each role receives a small YAML envelope:
+Each sync role receives a small YAML envelope:
 
 ```yaml
-role: lark_private_chat_collector
+role: lark_private_chat_sync
 run_id: daily-memory_YYYY-MM-DD_hash
 date_window:
   start: "YYYY-MM-DDT00:00:00+08:00"
   end: "YYYY-MM-DDT22:00:00+08:00"
-memory_root: "/home/botinkit/.hermes/daily-memory/memory"
-raw_root: "/home/botinkit/.hermes/daily-memory/raw/YYYY-MM-DD"
+workdir: "/home/botinkit/.hermes/daily-memory"
+output_dir: "sources/feishu_private_chats"
 run_root: "/home/botinkit/.hermes/daily-memory/runs/YYYY-MM-DD"
 source_partition:
   kind: feishu_private_chat
@@ -161,20 +149,24 @@ constraints:
   preserve_source_refs: true
 ```
 
+Loop body workers receive the batch work order emitted by `memoryctl scan`/`run` (see `references/schemas.md`).
+
 Parallel-safe roles:
 
-- `lark_private_chat_collector`
-- `lark_group_chat_collector`
-- `lark_shared_docs_collector`
-- `lark_materials_collector`
-- `lark_calendar_collector`
-- `lark_meeting_minutes_collector`
-- `lark_tasks_base_collector`
-- `agent_workspace_collector`
+- `lark_private_chat_sync`
+- `lark_group_chat_sync`
+- `lark_shared_docs_sync`
+- `lark_materials_sync`
+- `lark_calendar_sync`
+- `lark_meeting_minutes_sync`
+- `lark_tasks_base_sync`
+- `agent_workspace_sync`
 
-Serial roles:
+Serial roles (one batch at a time, in engine order):
 
-- `knowledge_graph_merge_writer`
+- `classify_loop_worker`
+- `graph_loop_worker`
+- `attention_loop_worker`
 - `safety_quality_reviewer`
 - `memory_index_verifier`
 - `delivery_preparer`
@@ -214,7 +206,7 @@ Timezone: Asia/Shanghai.
 Window: current local date from 00:00 to now.
 Canonical memory root: ~/.hermes/daily-memory.
 
-Operate as an orchestrator. Create dynamic short-lived subagents where Hermes supports them; otherwise emulate the same atomic roles through isolated turns/scripts and artifact handoffs. Run guard/auth/channel checks first, collect sources in parallel where possible, merge serially, verify memory recall, and prepare the owner report. Do not notify third parties.
+Operate as an orchestrator. Create dynamic short-lived subagents where Hermes supports them; otherwise emulate the same atomic roles through isolated turns/scripts and artifact handoffs. Run guard/auth/channel checks first, sync sources in parallel where possible, then drain the loop pipeline with `memoryctl run --steps classify,graph,attention,index` (process and commit every batch), verify memory recall, and prepare the owner report. Do not notify third parties.
 ```
 
 ## 7. Delivery
@@ -247,7 +239,7 @@ Hermes skill smoke test, command shape may vary by installation:
 
 Memory recall validation:
 
-- Write a bridge note under `"$DAILY_ROOT/memory/daily-memory-install-test.md"`.
+- Run `memoryctl index --date <today>` to generate `"$DAILY_ROOT/knowledge/daily-memory-<today>.md"`.
 - Add or index a pointer through Hermes memory/provider.
 - Ask Hermes a narrow query for the bridge note title.
 - Record whether retrieval is native memory, external provider, file search, or unsupported.
@@ -263,7 +255,7 @@ If OpenClaw and Hermes run on the same host, prefer one authoritative root:
 Hermes then stores only a pointer:
 
 ```markdown
-Daily Memory is authoritative at /home/botinkit/.openclaw/workspace-daily-memory. Use memory/*.md bridge notes and graph files under memory/ for source-backed recall.
+Daily Memory is authoritative at /home/botinkit/.openclaw/workspace-daily-memory. Use the knowledge/ vault (entity notes and daily-memory bridge notes) for source-backed recall.
 ```
 
 This avoids duplicate graph writes and keeps event ids stable across agents.
@@ -273,4 +265,4 @@ This avoids duplicate graph writes and keeps event ids stable across agents.
 1. Relink `~/.hermes/skills/daily-memory-skill` to the previous backup.
 2. Restore any Hermes memory pointer if changed.
 3. Disable the cron/systemd timer.
-4. Keep `daily-memory/runs/` and `daily-memory/raw/` unless the user explicitly asks to delete them.
+4. Keep `daily-memory/runs/`, `daily-memory/sources/`, and `daily-memory/knowledge/` unless the user explicitly asks to delete them.

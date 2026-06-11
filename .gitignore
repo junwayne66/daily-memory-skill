@@ -7,7 +7,19 @@ __MACOSX/
 .env
 .env.*
 
-runs/
-raw/
-reports/
-memory/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# canonical installed copies (install.sh share dir, when repo doubles as /workspace)
+/share-skills/
+
+# runtime workspace artifacts (never commit a live workdir into the skill repo)
+/runs/
+/raw/
+/reports/
+/memory/
+/sources/
+/knowledge/
+/state/
+/index/
